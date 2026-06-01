@@ -1,13 +1,14 @@
 // Copyright 2021 GHA Test Team
 
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include <cstdint>
+#include <gtest/gtest.h>
+
 #include <chrono>
 #include <future>
 #include <memory>
 #include <stdexcept>
 #include <thread>
+
 #include "TimedDoor.h"
 
 class MockTimerClient : public TimerClient {
@@ -18,22 +19,29 @@ class MockTimerClient : public TimerClient {
 class TimedDoorFixture : public ::testing::Test {
  protected:
   std::unique_ptr<TimedDoor> door;
+
   void SetUp() override {
-    door = std::make_unique<TimedDoor>(15);
+    door = std::make_unique<TimedDoor>(30);
     door->lock();
   }
+
   void TearDown() override {
     door.reset();
   }
 };
 
-TEST_F(TimedDoorFixture, DoorIsClosedAfterSetup) {
+TEST_F(TimedDoorFixture, DoorStartsClosedAfterSetup) {
   EXPECT_FALSE(door->isDoorOpened());
 }
 
 TEST_F(TimedDoorFixture, LockKeepsDoorClosed) {
   door->lock();
+
   EXPECT_FALSE(door->isDoorOpened());
+}
+
+TEST_F(TimedDoorFixture, TimeoutValueIsReturnedByGetter) {
+  EXPECT_EQ(door->getTimeOut(), 30);
 }
 
 TEST_F(TimedDoorFixture, ThrowStateDoesNotThrowForClosedDoor) {
@@ -41,84 +49,122 @@ TEST_F(TimedDoorFixture, ThrowStateDoesNotThrowForClosedDoor) {
 }
 
 TEST_F(TimedDoorFixture, ThrowStateThrowsForOpenedDoor) {
-  try {
-    door->unlock();
-  } catch (const std::runtime_error&) {
-  }
-  EXPECT_THROW(door->throwState(), std::runtime_error);
+  TimedDoor localDoor(0);
+  localDoor.lock();
+
+  EXPECT_THROW(localDoor.unlock(), std::runtime_error);
+
+  EXPECT_THROW(localDoor.throwState(), std::runtime_error);
 }
 
-TEST(TimedDoorStandalone, UnlockThrowsIfDoorIsStillOpenAfterTimeout) {
+TEST(TimedDoorStandalone, UnlockThrowsWhenDoorStaysOpenedUntilTimeout) {
   TimedDoor door(0);
   door.lock();
-  EXPECT_THROW(door.unlock(), std::runtime_error);
-}
 
-TEST(TimedDoorStandalone, TimeoutValueIsStoredInDoor) {
-  TimedDoor door(456);
-  EXPECT_EQ(door.getTimeOut(), 456);
+  EXPECT_THROW(door.unlock(), std::runtime_error);
 }
 
 TEST(TimedDoorStandalone, DoorRemainsOpenedAfterUnlockException) {
   TimedDoor door(0);
   door.lock();
-  try {
-    door.unlock();
-  } catch (const std::runtime_error&) {
-  }
+
+  EXPECT_THROW(door.unlock(), std::runtime_error);
   EXPECT_TRUE(door.isDoorOpened());
 }
 
-TEST(TimedDoorStandalone, UnlockDoesNotThrowIfDoorGetsClosedBeforeTimeout) {
-  TimedDoor door(100);
+TEST(TimedDoorStandalone, UnlockReturnsNormallyWhenDoorGetsClosedInTime) {
+  TimedDoor door(80);
   door.lock();
-  auto worker = std::async(std::launch::async, [&door]() -> bool {
+
+  auto worker = std::async(std::launch::async, [&door]() {
     try {
       door.unlock();
-      return false;
-    } catch (const std::runtime_error&) {
       return true;
+    } catch (const std::runtime_error&) {
+      return false;
     }
   });
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(15));
   door.lock();
-  EXPECT_FALSE(worker.get());
+
+  EXPECT_TRUE(worker.get());
+  EXPECT_FALSE(door.isDoorOpened());
+}
+
+TEST(TimedDoorStandalone, NegativeTimeoutIsNormalizedToZero) {
+  TimedDoor door(-10);
+
+  EXPECT_EQ(door.getTimeOut(), 0);
+}
+
+TEST(TimedDoorStandalone, LockAfterFailedUnlockClosesDoorAgain) {
+  TimedDoor door(0);
+  door.lock();
+
+  EXPECT_THROW(door.unlock(), std::runtime_error);
+  door.lock();
+
   EXPECT_FALSE(door.isDoorOpened());
 }
 
 TEST(TimerStandalone, RegisterWithNullClientDoesNotThrow) {
   Timer timer;
+
   EXPECT_NO_THROW(timer.tregister(0, nullptr));
 }
 
-TEST(TimerStandalone, RegisterCallsClientTimeout) {
+TEST(TimerStandalone, RegisterInvokesClientTimeoutOnce) {
   Timer timer;
   MockTimerClient client;
+
   EXPECT_CALL(client, Timeout()).Times(1);
   timer.tregister(0, &client);
 }
 
-TEST(TimerStandalone, RegisterWithDelayStillCallsClientTimeout) {
+TEST(TimerStandalone, RegisterWithPositiveDelayStillInvokesClient) {
   Timer timer;
   MockTimerClient client;
+
   EXPECT_CALL(client, Timeout()).Times(1);
   timer.tregister(5, &client);
 }
 
-TEST(DoorTimerAdapterStandalone, TimeoutThrowsWhenDoorRemainsOpened) {
+TEST(TimerStandalone, RegisterWaitsBeforeCallbackForPositiveTimeout) {
+  Timer timer;
+  MockTimerClient client;
+  const auto started = std::chrono::steady_clock::now();
+
+  EXPECT_CALL(client, Timeout()).Times(1);
+  timer.tregister(5, &client);
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  EXPECT_GE(elapsed.count(), 5);
+}
+
+TEST(DoorTimerAdapterStandalone, TimeoutThrowsIfDoorIsStillOpened) {
   TimedDoor door(0);
   door.lock();
-  try {
-    door.unlock();
-  } catch (const std::runtime_error&) {
-  }
+
+  EXPECT_THROW(door.unlock(), std::runtime_error);
   DoorTimerAdapter adapter(door);
+
   EXPECT_THROW(adapter.Timeout(), std::runtime_error);
 }
 
-TEST(DoorTimerAdapterStandalone, TimeoutDoesNotThrowWhenDoorClosed) {
-  TimedDoor door(0);
+TEST(DoorTimerAdapterStandalone, TimeoutDoesNotThrowForClosedDoor) {
+  TimedDoor door(10);
   door.lock();
   DoorTimerAdapter adapter(door);
+
+  EXPECT_NO_THROW(adapter.Timeout());
+}
+
+TEST(DoorTimerAdapterStandalone, TimeoutReflectsDoorStateAfterManualClose) {
+  TimedDoor door(10);
+  door.lock();
+  DoorTimerAdapter adapter(door);
+
   EXPECT_NO_THROW(adapter.Timeout());
 }
